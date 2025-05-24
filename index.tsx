@@ -9,7 +9,7 @@ import { showNotification } from "@api/Notifications";
 import { definePluginSettings, Settings } from "@api/Settings";
 import { Devs } from "@utils/constants";
 import definePlugin, { OptionType } from "@utils/types";
-import { findByPropsLazy, findStoreLazy } from "@webpack";
+import { findStoreLazy } from "@webpack";
 import { Menu, PresenceStore, React, SelectedChannelStore, Tooltip, UserStore } from "@webpack/common";
 import type { Channel, User } from "discord-types/general";
 import { CSSProperties } from "react";
@@ -42,6 +42,16 @@ interface PresenceUpdate {
     }>;
 }
 
+interface StatusChange {
+    userId: string;
+    username: string;
+    oldStatus: string;
+    newStatus: string;
+    oldClientStatus?: Partial<Record<Platform, string>>;
+    newClientStatus?: Partial<Record<Platform, string>>;
+    timestamp: number;
+}
+
 interface VoiceState {
     userId: string;
     channelId?: string;
@@ -68,7 +78,16 @@ function shouldBeNative() {
 
 const SessionsStore = findStoreLazy("SessionsStore");
 
-const StatusUtils = findByPropsLazy("useStatusFillColor", "StatusTypes");
+const StatusColors = {
+    online: "#23a55a",
+    idle: "#f0b232",
+    dnd: "#f23f43",
+    offline: "#80848e",
+    streaming: "#593695",
+    invisible: "#80848e"
+};
+
+const useStatusFillColor = (status: string) => StatusColors[status] || StatusColors.offline;
 
 function Icon(path: string, opts?: { viewBox?: string; width?: number; height?: number; }) {
     return ({ color, tooltip, small }: { color: string; tooltip: string; small: boolean; }) => (
@@ -100,7 +119,7 @@ const PlatformIcon = ({ platform, status, small }: { platform: Platform, status:
     const tooltip = platform[0].toUpperCase() + platform.slice(1);
     const Icon = Icons[platform] ?? Icons.desktop;
 
-    return <Icon color={StatusUtils.useStatusFillColor(status)} tooltip={tooltip} small={small} />;
+    return <Icon color={useStatusFillColor(status)} tooltip={tooltip} small={small} />;
 };
 
 interface PlatformIndicatorProps {
@@ -196,7 +215,13 @@ export const settings = definePluginSettings({
         description: "User IDs (comma separated)",
         restartNeeded: false,
         default: "",
-    }
+    },
+    customSound: {
+        type: OptionType.STRING,
+        description: "URL del sonido personalizado para las notificaciones",
+        restartNeeded: false,
+        default: "",
+    },
 });
 
 function getUserIdList() {
@@ -208,16 +233,62 @@ function getUserIdList() {
     }
 }
 
-// show rich body with user avatar
-const getRichBody = (user: User, text: string | React.ReactNode) => <div
-    style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "10px" }}>
-    <div style={{ position: "relative" }}>
-        <img src={user.getAvatarURL(void 0, 80, true)}
-            style={{ width: "80px", height: "80px", borderRadius: "15%" }} alt={`${user.username}'s avatar`} />
-        <PlatformIndicator user={user} style={{ position: "absolute", top: "-8px", right: "-10px" }} />
+const getRichBody = (user: User, text: string | React.ReactNode) => (
+    <div style={{
+        display: "flex",
+        alignItems: "center",
+        gap: "12px",
+        width: "100%",
+        maxWidth: "100%",
+        padding: "4px 0"
+    }}>
+        <div style={{
+            position: "relative",
+            flexShrink: 0,
+            display: "inline-flex"
+        }}>
+            <img
+                src={user.getAvatarURL(void 0, 80, true)}
+                style={{
+                    width: "40px",
+                    height: "40px",
+                    borderRadius: "15%",
+                    objectFit: "cover",
+                    flexShrink: 0
+                }}
+                alt={`${user.username}'s avatar`}
+            />
+            <PlatformIndicator
+                user={user}
+                style={{
+                    position: "absolute",
+                    top: "-8px",
+                    right: "-10px",
+                }}
+            />
+        </div>
+
+        <span style={{
+            flex: 1,
+            overflow: "visible",
+            whiteSpace: "normal",
+            wordBreak: "break-word",
+            fontSize: "14px",
+            lineHeight: "1.4"
+        }}>
+            {text}
+        </span>
     </div>
-    <span>{text}</span>
-</div>;
+);
+
+
+function playNotificationSound() {
+    const { customSound } = settings.store;
+    if (customSound) {
+        const audio = new Audio(customSound);
+        audio.play().catch(console.error);
+    }
+}
 
 function triggerVoiceNotification(userId: string, userChannelId: string | null) {
     const user = UserStore.getUser(userId);
@@ -234,6 +305,7 @@ function triggerVoiceNotification(userId: string, userChannelId: string | null) 
                 noPersist: !settings.store.persistNotifications,
                 richBody: getRichBody(user, `${name} joined a new voice channel`),
             });
+            playNotificationSound();
         }
     } else {
         showNotification({
@@ -242,17 +314,43 @@ function triggerVoiceNotification(userId: string, userChannelId: string | null) 
             noPersist: !settings.store.persistNotifications,
             richBody: getRichBody(user, `${name} left their voice channel`),
         });
+        playNotificationSound();
     }
 }
 
 function toggleUserNotify(userId: string) {
-    const userIds = getUserIdList();
-    if (userIds.includes(userId)) {
-        userIds.splice(userIds.indexOf(userId), 1);
+    const currentUserIds = getUserIdList();
+    const user = UserStore.getUser(userId);
+    if (!user || user.bot) return;
+
+    const newUserIdList = [...currentUserIds];
+
+    if (newUserIdList.includes(userId)) {
+        const index = newUserIdList.indexOf(userId);
+        if (index > -1) {
+            newUserIdList.splice(index, 1);
+        }
+        lastStatuses.delete(userId);
+        lastClientStatuses.delete(userId);
     } else {
-        userIds.push(userId);
+        newUserIdList.push(userId);
+        if (PresenceStore) {
+            let currentStatus = PresenceStore.getStatus(userId);
+            if (typeof currentStatus !== "string" || currentStatus === undefined) {
+                currentStatus = PresenceStore.getState()?.statuses?.[userId];
+            }
+            if (typeof currentStatus !== "string") {
+                currentStatus = "offline";
+            }
+            lastStatuses.set(userId, currentStatus);
+
+            const currentClientStatus = PresenceStore.getState()?.clientStatuses?.[userId];
+            if (currentClientStatus) {
+                lastClientStatuses.set(userId, currentClientStatus);
+            }
+        }
     }
-    settings.store.userIds = userIds.join(",");
+    settings.store.userIds = newUserIdList.join(",");
 }
 
 interface UserContextProps {
@@ -261,11 +359,19 @@ interface UserContextProps {
     user: User;
 }
 
+const formatTimestamp = (timestamp: number) => {
+    const date = new Date(timestamp);
+    return date.toLocaleString();
+};
+
 const UserContext: NavContextMenuPatchCallback = (children, { user }: UserContextProps) => {
     if (!user || user.id === UserStore.getCurrentUser().id) return;
     const isNotifyOn = getUserIdList().includes(user.id);
     const label = isNotifyOn ? "Don't notify on changes" : "Notify on changes";
     const icon = isNotifyOn ? NotificationsOffIcon : NotificationsOnIcon;
+
+    const userHistory = statusHistory.get(user.id) || [];
+    const hasHistory = userHistory.length > 0;
 
     children.splice(-1, 0, (
         <Menu.MenuGroup>
@@ -275,16 +381,225 @@ const UserContext: NavContextMenuPatchCallback = (children, { user }: UserContex
                 action={() => toggleUserNotify(user.id)}
                 icon={icon}
             />
+            {hasHistory && (
+                <Menu.MenuItem
+                    id="view-status-history"
+                    label="Show status history"
+                    action={() => {
+                        if (userHistory.length === 0) {
+                            showNotification({
+                                title: "No status history found",
+                                body: "No status history found for this user.",
+                                noPersist: true,
+                            });
+
+                            return;
+                        }
+
+                        showNotification({
+                            title: `${user.username}'s status history`,
+                            body: userHistory.map(change => {
+                                return `${formatTimestamp(change.timestamp)}: ${change.oldStatus} → ${change.newStatus}`;
+                            }).join("\n"),
+                            noPersist: false,
+                            richBody: (
+                                <div style={{ display: "flex", flexDirection: "column", gap: "8px", maxHeight: "70vh", maxWidth: "600px", overflowY: "auto", overflowX: "hidden", padding: "8px" }}>
+                                    {userHistory.map((change, index) => (
+                                        <div key={index} style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                                            <span>{formatTimestamp(change.timestamp)}:</span>
+                                            <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                                                {change.oldClientStatus && Object.entries(change.oldClientStatus).map(([platform, status]) => (
+                                                    <PlatformIcon
+                                                        key={platform}
+                                                        platform={platform as Platform}
+                                                        status={status}
+                                                        small={false}
+                                                    />
+                                                ))}
+                                                <span>{change.oldStatus}</span>
+                                            </div>
+                                            <span>→</span>
+                                            <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                                                {change.newClientStatus && Object.entries(change.newClientStatus).map(([platform, status]) => (
+                                                    <PlatformIcon
+                                                        key={platform}
+                                                        platform={platform as Platform}
+                                                        status={status}
+                                                        small={false}
+                                                    />
+                                                ))}
+                                                <span>{change.newStatus}</span>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )
+                        });
+                    }}
+                />
+            )}
         </Menu.MenuGroup>
     ));
 };
 
 const lastStatuses = new Map<string, string>();
+const lastClientStatuses = new Map<string, Partial<Record<Platform, string>>>();
+const statusHistory = new Map<string, StatusChange[]>();
+
+function _initializeAllMonitoredUserStatuses() {
+    if (!PresenceStore || !UserStore || !settings?.store || !getUserIdList) {
+        return;
+    }
+    const userIds = getUserIdList();
+    if (!Array.isArray(userIds)) return;
+
+    for (const userId of userIds) {
+        const user = UserStore.getUser(userId);
+        if (!user || user.bot) continue;
+
+        let currentStatus = PresenceStore.getStatus(userId);
+        if (typeof currentStatus !== "string" || currentStatus === undefined) {
+            currentStatus = PresenceStore.getState()?.statuses?.[userId];
+        }
+        if (typeof currentStatus !== "string") {
+            currentStatus = "offline";
+        }
+        lastStatuses.set(userId, currentStatus);
+
+        const currentClientStatus = PresenceStore.getState()?.clientStatuses?.[userId];
+        if (currentClientStatus) {
+            lastClientStatuses.set(userId, currentClientStatus);
+        }
+    }
+}
 
 export default definePlugin({
     name: "NotifyUserChanges",
     description: "Adds a notify option in the user context menu to get notified when a user changes voice channels or online status",
     authors: [Devs.D3SOX],
+
+    start() {
+        _initializeAllMonitoredUserStatuses();
+    },
+
+    patches: [
+        {
+            find: ".privateChannelsHeaderContainer,",
+            replacement: {
+                match: /(?<=span",{)className:\i\.headerText,/,
+                replace: "onClick:()=>$self.showGlobalHistory(),$&"
+            }
+        }
+    ],
+
+    showGlobalHistory() {
+        const allHistory = Array.from(statusHistory.entries()).flatMap(([userId, changes]) => {
+            const user = UserStore.getUser(userId);
+            if (!user) return [];
+            return changes.map(change => ({ ...change, user }));
+        });
+
+        allHistory.sort((a, b) => b.timestamp - a.timestamp);
+
+        if (allHistory.length === 0) {
+            showNotification({
+                title: "No status history available",
+                body: "There is no status history available for any user.",
+                noPersist: false,
+            });
+
+            return;
+        }
+
+        showNotification({
+            title: "Users Status History",
+            body: "",
+            noPersist: false,
+            richBody: (
+                <div style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: "8px",
+                    maxHeight: "70vh",
+                    maxWidth: "600px",
+                    overflowY: "auto",
+                    overflowX: "hidden",
+                    padding: "8px",
+                    scrollbarWidth: "thin",
+                    scrollbarColor: "var(--scrollbar-thin-thumb) var(--scrollbar-thin-track)",
+                    ...({
+                        "&::-webkit-scrollbar": {
+                            width: "8px",
+                            height: "8px"
+                        },
+                        "&::-webkit-scrollbar-track": {
+                            background: "var(--scrollbar-thin-track)",
+                            borderRadius: "10px"
+                        },
+                        "&::-webkit-scrollbar-thumb": {
+                            background: "var(--scrollbar-thin-thumb)",
+                            borderRadius: "10px",
+                            border: "2px solid transparent",
+                            backgroundClip: "padding-box"
+                        },
+                        "&::-webkit-scrollbar-corner": {
+                            background: "transparent"
+                        }
+                    } as React.CSSProperties) // Type assertion for pseudo-elements
+                }}>
+                    {allHistory.map((change, index) => (
+                        <div key={index} style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: "8px",
+                            padding: "12px",
+                            backgroundColor: "var(--background-secondary)",
+                            borderRadius: "8px",
+                            width: "100%",
+                            boxSizing: "border-box"
+                        }}>
+                            <img
+                                src={change.user.getAvatarURL()}
+                                style={{ width: "32px", height: "32px", borderRadius: "50%" }}
+                                alt={`${change.user.username}'s avatar`}
+                            />
+                            <div style={{ flex: 1 }}>
+                                <div style={{ fontWeight: "bold" }}>{change.user.username}</div>
+                                <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                                    <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                                        {change.oldClientStatus && Object.entries(change.oldClientStatus).map(([platform, status]) => (
+                                            <PlatformIcon
+                                                key={platform}
+                                                platform={platform as Platform}
+                                                status={status}
+                                                small={false}
+                                            />
+                                        ))}
+                                        <span>{change.oldStatus}</span>
+                                    </div>
+                                    <span>→</span>
+                                    <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                                        {change.newClientStatus && Object.entries(change.newClientStatus).map(([platform, status]) => (
+                                            <PlatformIcon
+                                                key={platform}
+                                                platform={platform as Platform}
+                                                status={status}
+                                                small={false}
+                                            />
+                                        ))}
+                                        <span>{change.newStatus}</span>
+                                    </div>
+                                </div>
+                                <div style={{ fontSize: "0.8em", color: "var(--text-muted)" }}>
+                                    {formatTimestamp(change.timestamp)}
+                                </div>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            )
+        });
+    },
 
     settings,
 
@@ -293,6 +608,9 @@ export default definePlugin({
     },
 
     flux: {
+        CONNECTION_OPEN: () => {
+            _initializeAllMonitoredUserStatuses();
+        },
         VOICE_STATE_UPDATES({ voiceStates }: { voiceStates: VoiceState[]; }) {
             if (!settings.store.notifyVoice || !settings.store.userIds) {
                 return;
@@ -305,44 +623,70 @@ export default definePlugin({
                     }
 
                     if (channelId) {
-                        // move or join new channel
                         triggerVoiceNotification(userId, channelId);
                     } else if (oldChannelId) {
-                        // leave
                         triggerVoiceNotification(userId, null);
                     }
                 }
             }
         },
         PRESENCE_UPDATES({ updates }: { updates: PresenceUpdate[]; }) {
-            if (!settings.store.notifyStatus || !settings.store.userIds) {
-                return;
-            }
-            for (const { user: { id: userId, username }, status, clientStatus } of updates) {
-                const isFollowed = getUserIdList().includes(userId);
-                if (!isFollowed) {
+            if (!settings.store.notifyStatus || !settings.store.userIds?.length) return;
+            const userIds = getUserIdList();
+            if (!userIds.length) return;
+
+            for (const update of updates) {
+                const { user: { id: userId }, status: newStatus, clientStatus: newClientStatus } = update;
+
+                if (!userIds.includes(userId)) continue;
+
+                const user = UserStore.getUser(userId);
+                if (!user || user.bot) continue;
+
+                const oldStatus = lastStatuses.get(userId);
+                const oldClientStatus = lastClientStatuses.get(userId);
+
+                if (oldStatus === undefined) {
+                    lastStatuses.set(userId, newStatus);
+                    if (newClientStatus) {
+                        lastClientStatuses.set(userId, newClientStatus);
+                    }
                     continue;
                 }
 
-                if (!clientStatus) {
-                    continue;
-                }
-                // this is also triggered for multiple guilds and when only the activities change, so we have to check if the status actually changed
-                if (lastStatuses.has(userId) && lastStatuses.get(userId) !== status) {
-                    const user = UserStore.getUser(userId);
-                    // @ts-ignore
-                    const name = user.globalName || username;
+                if (oldStatus !== newStatus) {
+                    const displayName = user.username;
+                    const title = shouldBeNative() ? `User ${displayName} changed status` : "User status change";
+                    const statusTextOld = { online: "Online", idle: "Idle", dnd: "Do Not Disturb", offline: "Offline", streaming: "Streaming", invisible: "Invisible" }[oldStatus] || oldStatus;
+                    const statusTextNew = { online: "Online", idle: "Idle", dnd: "Do Not Disturb", offline: "Offline", streaming: "Streaming", invisible: "Invisible" }[newStatus] || newStatus;
 
                     showNotification({
-                        title: shouldBeNative() ? `${name} changed status` : "User status change",
-                        body: `They are now ${status}`,
+                        title,
+                        body: `changed status from ${statusTextOld} to ${statusTextNew}`,
                         noPersist: !settings.store.persistNotifications,
-                        richBody: getRichBody(user, `${name}'s status is now ${status}`),
+                        richBody: getRichBody(user, <>{displayName} changed status from <strong style={{ color: useStatusFillColor(oldStatus) }}>{statusTextOld}</strong> to <strong style={{ color: useStatusFillColor(newStatus) }}>{statusTextNew}</strong></>),
+                    });
+                    playNotificationSound();
+
+                    if (!statusHistory.has(userId)) {
+                        statusHistory.set(userId, []);
+                    }
+                    statusHistory.get(userId)!.push({
+                        userId,
+                        username: displayName,
+                        oldStatus: oldStatus,
+                        newStatus,
+                        oldClientStatus: oldClientStatus,
+                        newClientStatus: newClientStatus,
+                        timestamp: Date.now()
                     });
                 }
-                lastStatuses.set(userId, status);
+
+                lastStatuses.set(userId, newStatus);
+                if (newClientStatus) {
+                    lastClientStatuses.set(userId, newClientStatus);
+                }
             }
         }
     },
-
 });
